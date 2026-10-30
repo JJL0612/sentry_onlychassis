@@ -68,10 +68,10 @@ int main(void) {
   assert(GimbalLinkGetBigYawRequest(&decoded));
   near(decoded.target_rate_rad_s, 0.25f);
 
-  /* 100 ms local receive timeout. */
-  tick = 200U;
+  /* Local receive timeout follows the configured BigYaw request window. */
+  tick = 100U + kGimbalLinkBigYawTimeoutMs;
   assert(GimbalLinkGetBigYawRequest(&decoded));
-  tick = 201U;
+  tick = 100U + kGimbalLinkBigYawTimeoutMs + 1U;
   assert(!GimbalLinkGetBigYawRequest(&decoded));
 
   /* A fresh request for this boot id is accepted again. */

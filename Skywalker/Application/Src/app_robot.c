@@ -69,7 +69,7 @@ enum {
   kRobotGimbalEnabled = 0U,
   // 大 Yaw 由底盘板执行；陀螺仪补偿使用电机已配置的速度模式。
   kRobotBigYawEnabled = 1U,
-  // 1U: 底盘 IMU 实测角速度反向补偿 + 滚轮转向，不使用云台 IMU。
+  // 1U: 底盘角速度前馈 + 云台板载 IMU 航向/角速度闭环 + 滚轮转向。
   // 0U: 编码器位置/速度串级，保持相对底盘角度。
   kRobotBigYawGyroCompensationEnabled = 1U,
   // 1U: 无有效板间请求时，底盘本地 DT7 滚轮控制大 Yaw。
@@ -1413,16 +1413,56 @@ static void RobotBigYawResetCascade(void) {
   g_robot.big_yaw_torque = 0.0f;
 }
 
-// Physical CCW-positive relative rate = operator world rate - measured base rate.
-// Convert to motor installation direction only after combining both terms.
-static float RobotBigYawStabilizedRate(float operator_rate) {
-  const float relative_rate = operator_rate - g_robot.chassis.yaw_rate;
+// Gimbal heading is relative to its own IMU origin, independent of the
+// encoder zero used for chassis translation. Predict only by sample age.
+static float RobotBigYawStabilizedRate(const GimbalImuYaw *imu,
+                                       float operator_rate, float dt) {
+  const float heading = RobotWrapPi(imu->yaw_delta_rad +
+      imu->yaw_rate_rad_s * (float)imu->source_age_ms * 0.001f);
+  if (!g_robot.big_yaw_heading_initialized ||
+      g_robot.big_yaw_heading_boot_id != imu->sender_boot_id ||
+      g_robot.big_yaw_heading_zero_generation != imu->zero_generation) {
+    g_robot.big_yaw_heading_initialized = true;
+    g_robot.big_yaw_heading_boot_id = imu->sender_boot_id;
+    g_robot.big_yaw_heading_zero_generation = imu->zero_generation;
+    g_robot.big_yaw_heading_target_rad = heading;
+    g_robot.big_yaw_rate_integral = 0.0f;
+  }
+  // Release captures the measured heading instead of chasing a lagging target.
+  if (operator_rate == 0.0f && g_robot.big_yaw_previous_operator_rate != 0.0f) {
+    g_robot.big_yaw_heading_target_rad = heading;
+    g_robot.big_yaw_rate_integral = 0.0f;
+  }
+  g_robot.big_yaw_previous_operator_rate = operator_rate;
+  float error = RobotClamp(RobotWrapPi(
+      g_robot.big_yaw_heading_target_rad + operator_rate * dt - heading),
+      -kRobotBigYawMaxPositionErrorRad, kRobotBigYawMaxPositionErrorRad);
+  g_robot.big_yaw_heading_target_rad = RobotWrapPi(heading + error);
+  g_robot.big_yaw_heading_error_rad = error;
+  const float world_rate = operator_rate + RobotClamp(2.0f * error, -1.5f, 1.5f);
+  g_robot.big_yaw_world_rate_target_radps = world_rate;
+  const float rate_error = world_rate - imu->yaw_rate_rad_s;
+  const float feedforward = world_rate - g_robot.chassis.yaw_rate;
+  const float proportional = 0.25f * rate_error;
+  const float integral = g_robot.big_yaw_rate_integral + 0.5f * rate_error * dt;
+  const float relative_limit = kRobotBigYawGyroMaxRateRadps /
+      fabsf(kRobotBigYawGyroRatio);
+  const float candidate = feedforward + proportional + integral;
+  // Include feedforward in anti-windup so high base rates cannot accumulate I.
+  if (fabsf(candidate) <= relative_limit ||
+      (candidate > relative_limit && rate_error < 0.0f) ||
+      (candidate < -relative_limit && rate_error > 0.0f)) {
+    g_robot.big_yaw_rate_integral = integral;
+  }
+  const float relative_rate = feedforward + proportional +
+      g_robot.big_yaw_rate_integral;
   return RobotClamp(kRobotBigYawGyroDirection * kRobotBigYawGyroRatio * relative_rate,
       -kRobotBigYawGyroMaxRateRadps, kRobotBigYawGyroMaxRateRadps);
 }
 
-/* CAN3 0x206 速度模式：底盘 IMU 角速度反向补偿，不读取云台 IMU。
- * 编码器独立决定平移坐标；补偿不积分航向、不修改换系角。 */
+/* CAN3 0x206 velocity mode: base gyro feedforward and gimbal onboard BMI088
+ * heading/rate feedback. Missing IMU data disables output; recovery recaptures
+ * heading. Encoder-based translation retains its independent fixed zero. */
 static void RobotBigYawControl(void) {
   if (kRobotBigYawEnabled == 0U) {
     return;
@@ -1466,9 +1506,15 @@ static void RobotBigYawControl(void) {
         RobotRcNormalize(g_dt7_object.rocker.wheel), kRobotChassisYawWheelDeadband) *
         kRobotBigYawMaxRateRadps;
   }
+  GimbalImuYaw gimbal_imu = {0};
+  const bool gimbal_imu_valid = kRobotBigYawGyroCompensationEnabled != 0U &&
+      GimbalLinkGetImuYaw(&gimbal_imu) && gimbal_imu.valid &&
+      gimbal_imu.source_age_ms <= 50U &&
+      isfinite(gimbal_imu.yaw_delta_rad) && isfinite(gimbal_imu.yaw_rate_rad_s);
   bool gyro_active = kRobotBigYawGyroCompensationEnabled != 0U &&
       g_robot.big_yaw_gyro_authorized && g_robot.chassis.imu_ready &&
-      isfinite(g_robot.chassis.yaw_rate) && (request_active || manual_active);
+      isfinite(g_robot.chassis.yaw_rate) && gimbal_imu_valid &&
+      (request_active || manual_active);
   // 速度模式合成滚轮期望世界角速度与底盘自稳补偿；不叠加右杆位置环。
   if (kRobotBigYawGyroCompensationEnabled != 0U) {
     request_active = false;
@@ -1588,7 +1634,7 @@ static void RobotBigYawControl(void) {
   }
 
   if (gyro_active) {
-    float target_rate = RobotBigYawStabilizedRate(operator_yaw_rate);
+    float target_rate = RobotBigYawStabilizedRate(&gimbal_imu, operator_yaw_rate, dt);
     g_robot.big_yaw_target_rate = target_rate;
     g_robot.big_yaw_target_angle = feedback_angle;
     g_robot.big_yaw_last_command_sequence = request_valid ? request.source_sequence : 0U;

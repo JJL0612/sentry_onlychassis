@@ -37,7 +37,7 @@ https://docs.openarm.dev/assets/files/dm4310-5d089e0b013d8e2fc203c5b670008a66.pd
 
 ## 验证
 
-- `python3 tests/test_big_yaw_gyro.py`：真实控制函数与原生速度帧、双向前馈、航向跨 pi、滚轮松手、IMU 会话/零位切换、丢失/非有限/过期数据、故障保护、含电机 20 ms 滞后/10% 速度增益误差/底盘 gyro 0.03 rad/s 偏差的两分钟模拟；另测旋转中滚轮转向与松手锁定。
+- `python3 tests/test_big_yaw_gyro.py`：真实控制函数与原生速度帧、双向前馈、航向跨 pi、滚轮松手、IMU 会话/零位切换、丢失/非有限/过期数据、故障保护、含电机 20 ms 滞后/10% 速度增益误差/底盘 gyro 0.03 rad/s 偏差的两分钟模拟，覆盖 2～3.4 rad/s、4 s 周期余弦旋转、反向、滚轮转向与松手锁定。
 - `python3 tests/test_gimbal_translation.py`：编码器整圈、不同安装符号/零位、模拟 IMU 漂移下方向不变、反馈失效和四舵轮解算。
 - 云台 `bash tests/interboard/run_dm_imu_tests.sh`：板载 IMU 数据填充、0x0404 编码和底盘实际解析。
 - 两块板 Debug 构建通过。未完成实车闭环测试。

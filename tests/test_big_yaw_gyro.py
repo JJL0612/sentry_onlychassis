@@ -163,23 +163,45 @@ int main(void) {
   near(sent_rate,kRobotBigYawGyroDirection*kRobotBigYawGyroRatio*(-2));
   sensor_rate=-3;step(true);
   near(sent_rate,kRobotBigYawGyroDirection*kRobotBigYawGyroRatio*3);
-  // Actual measured base rate, never the requested chassis rotation.
-  board.wz_rad_s=0.8f;sensor_rate=0;step(true);near(sent_rate,0);
-  request.target_rate_rad_s=0.5f;sensor_rate=0.8f;step(true);
-  near(sent_rate,kRobotBigYawGyroDirection*kRobotBigYawGyroRatio*(-0.3f));
-  request.target_rate_rad_s=0;step(true);
-  near(sent_rate,kRobotBigYawGyroDirection*kRobotBigYawGyroRatio*(-0.8f));
-  // Changing, invalid or missing cloud IMU never affects compensation.
-  for(int i=0;i<1000;++i){
-    external_imu.yaw_delta_rad=i*0.1f;external_imu.yaw_rate_rad_s=NAN;
-    external_imu_available=i%2;external_imu.valid=false;
-    step(true);assert(g_robot.big_yaw_active);
-    near(sent_rate,kRobotBigYawGyroDirection*kRobotBigYawGyroRatio*(-0.8f));
+  // Feedforward uses the measured base rate, never the requested spin rate.
+  board.wz_rad_s=3.4f;sensor_rate=0;step(true);near(sent_rate,0);
+  external_imu.yaw_delta_rad=0.1f;step(true);
+  assert(g_robot.big_yaw_heading_error_rad < -0.09f);
+  assert(sent_rate/kRobotBigYawGyroDirection < 0); // restore displaced heading
+  external_imu.yaw_delta_rad=0;external_imu.yaw_rate_rad_s=0.2f;
+  RobotBigYawResetCascade();step(true);
+  assert(sent_rate/kRobotBigYawGyroDirection < 0); // reject residual world rate
+  external_imu.yaw_rate_rad_s=0;
+  request.target_rate_rad_s=0.5f;step(true);
+  assert(g_robot.big_yaw_world_rate_target_radps>0.5f);
+  external_imu.yaw_delta_rad=0.25f;request.target_rate_rad_s=0;step(true);
+  near(g_robot.big_yaw_heading_target_rad,0.25f);
+  near(g_robot.big_yaw_heading_error_rad,0);
+  // Origin changes recapture instead of chasing an old heading.
+  external_imu.sender_boot_id++;external_imu.yaw_delta_rad=1;step(true);
+  near(g_robot.big_yaw_heading_error_rad,0);
+  external_imu.zero_generation++;external_imu.yaw_delta_rad=-1;step(true);
+  near(g_robot.big_yaw_heading_error_rad,0);
+  // Shortest heading error across +/-pi and age prediction.
+  RobotBigYawResetCascade();external_imu.yaw_delta_rad=3.13f;step(true);
+  external_imu.yaw_delta_rad=-3.13f;step(true);
+  assert(fabsf(g_robot.big_yaw_heading_error_rad)<0.03f);
+  RobotBigYawResetCascade();external_imu.yaw_delta_rad=0.1f;
+  external_imu.yaw_rate_rad_s=0.2f;external_imu.source_age_ms=20;step(true);
+  near(g_robot.big_yaw_heading_target_rad,0.104f);
+  external_imu.source_age_ms=0;external_imu.yaw_rate_rad_s=0;
+  // Missing, invalid, stale and nonfinite gimbal data disable; recover at new heading.
+  for(int fault=0;fault<5;fault++) {
+    external_imu_available=fault!=0;external_imu.valid=fault!=1;
+    external_imu.source_age_ms=fault==2?51:0;
+    external_imu.yaw_delta_rad=fault==3?NAN:0.7f;
+    external_imu.yaw_rate_rad_s=fault==4?NAN:0;
+    step(true);assert(!g_robot.big_yaw_active);near(sent_rate,0);
+    assert(!g_robot.big_yaw_heading_initialized);
+    external_imu_available=true;external_imu.valid=true;external_imu.source_age_ms=0;
+    external_imu.yaw_delta_rad=0.9f;external_imu.yaw_rate_rad_s=0;settle();
+    assert(g_robot.big_yaw_active);near(g_robot.big_yaw_heading_target_rad,0.9f);
   }
-  assert(gimbal_imu_reads==0);
-  sensor_rate=34;step(true);near(sent_rate,kRobotBigYawGyroMaxRateRadps);
-  sensor_rate=-34;step(true);near(sent_rate,-kRobotBigYawGyroMaxRateRadps);
-  // Base IMU loss, nonfinite rate and explicit permission revocation stop yaw.
   sensor_status=kBmi088NoSensor;step(true);assert(!g_robot.big_yaw_active);near(sent_rate,0);
   sensor_status=kBmi088NoError;sensor_rate=NAN;step(true);assert(!g_robot.big_yaw_active);
   sensor_rate=0;settle();assert(g_robot.big_yaw_active);
@@ -192,12 +214,41 @@ int main(void) {
   g_robot.yaw_motor.state.error_code=8;step(true);unsigned clears=clear_calls;
   step(true);assert(clear_calls==clears&&!g_robot.big_yaw_active);
   g_robot.yaw_motor.state.error_code=0;settle();assert(g_robot.big_yaw_active);
-  // Local wheel fallback adds operator rate before installation conversion.
-  board_available=false;peer_online=false;request_available=false;rc_frames=1;
-  g_dt7_object.rocker.wheel=660;sensor_rate=0.5f;settle();
-  near(sent_rate,kRobotBigYawGyroDirection*kRobotBigYawGyroRatio*0.5f);
-  assert(gimbal_imu_reads==0);
-  puts("PASS: measured base-rate cancellation, wheel/release, zero cloud IMU reads, permissions, sensor loss, faults, motor timeout and velocity DLC4");
+  // Anti-windup includes saturated base-rate feedforward.
+  sensor_rate=34;external_imu.yaw_rate_rad_s=1;
+  RobotBigYawResetCascade();settle();
+  near(sent_rate,kRobotBigYawGyroMaxRateRadps);near(g_robot.big_yaw_rate_integral,0);
+  // Simulated 20ms motor lag, 10% gain error and 0.03rad/s base gyro bias.
+  // Drive a 4s 2..3.4rad/s spin, then reverse; test wheel motion/release as well.
+  sensor_rate=0;external_imu.yaw_rate_rad_s=0;external_imu.yaw_delta_rad=0;
+  RobotBigYawResetCascade();settle();
+  float heading=0, relative=0, previous_world=0, max_error=0;
+  for(int i=0;i<60000;i++) {
+    float t=i*0.002f;
+    float base=(2.7f+0.7f*cosf(2*(float)M_PI*t/4))*(i<30000?1:-1);
+    sensor_rate=base+0.03f;
+    request.target_rate_rad_s=(i>=10000&&i<12000)?0.5f:0;
+    // Sample every 20ms; report actual sample age between packets.
+    if(i%10==0) {
+      external_imu.yaw_delta_rad=heading;
+      external_imu.yaw_rate_rad_s=previous_world;
+    }
+    external_imu.source_age_ms=(i%10)*2;
+    step(true);assert(g_robot.big_yaw_active);
+    float wanted_relative=sent_rate/(kRobotBigYawGyroDirection*kRobotBigYawGyroRatio);
+    relative+=0.002f/0.020f*(0.9f*wanted_relative-relative);
+    previous_world=base+relative;
+    heading=RobotWrapPi(heading+previous_world*0.002f);
+    if(i>15000)max_error=fmaxf(max_error,fabsf(RobotWrapPi(heading-g_robot.big_yaw_heading_target_rad)));
+  }
+  printf("Simulated heading error: final %.5f rad, peak after wheel release %.5f rad\n",
+    fabsf(RobotWrapPi(heading-g_robot.big_yaw_heading_target_rad)),max_error);
+  assert(fabsf(RobotWrapPi(heading-g_robot.big_yaw_heading_target_rad))<0.03f);
+  assert(max_error<0.2f);
+  // Lost board link cannot silently continue base-only cancellation.
+  peer_online=false;step(true);assert(!g_robot.big_yaw_active);
+  assert(gimbal_imu_reads>0);
+  puts("PASS: gimbal heading/rate feedback + base feedforward, release, origins, IMU loss, permissions, faults, saturation and DLC4");
 }
 """
 legacy_tests = tests.split("int main(void)")[0] + r"""
